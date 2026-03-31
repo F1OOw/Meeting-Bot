@@ -75,6 +75,8 @@ class ReminderService:
             await self._send_notification(meeting, "24h")
 
     async def _send_notification(self, meeting: Meeting, stage: str) -> None:
+        await self._send_channel_notification(meeting, stage)
+
         recipients = await self._resolve_dm_recipients(meeting)
         if not recipients:
             logger.warning(
@@ -115,6 +117,54 @@ class ReminderService:
                 )
 
         self.database.mark_notification_sent(meeting.meeting_id, stage)
+
+    async def _send_channel_notification(self, meeting: Meeting, stage: str) -> None:
+        channel = self.bot.get_channel(meeting.channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(meeting.channel_id)
+            except (discord.NotFound, discord.Forbidden):
+                logger.warning(
+                    "Could not access target channel %s for meeting %s",
+                    meeting.channel_id,
+                    meeting.meeting_id,
+                )
+                return
+
+        if not hasattr(channel, "send"):
+            logger.warning(
+                "Target channel %s for meeting %s does not support messages",
+                meeting.channel_id,
+                meeting.meeting_id,
+            )
+            return
+
+        start_unix = int(meeting.starts_at_utc.timestamp())
+        details_text = f"\nDetails: {meeting.details}" if meeting.details else ""
+        mentions = self._channel_mentions(meeting)
+        message = (
+            f"{mentions}\n{_stage_text(stage)}\n"
+            f"Meeting: **{meeting.title}**\n"
+            f"When: <t:{start_unix}:F> (<t:{start_unix}:R>)\n"
+            f"Meeting ID: `{meeting.meeting_id}`{details_text}"
+        )
+
+        try:
+            await channel.send(
+                message,
+                allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+            )
+        except (discord.Forbidden, discord.NotFound):
+            logger.warning(
+                "Failed to send channel notification for meeting %s to channel %s",
+                meeting.meeting_id,
+                meeting.channel_id,
+            )
+        except discord.HTTPException:
+            logger.exception(
+                "Discord API error while sending channel notification for meeting %s",
+                meeting.meeting_id,
+            )
 
     async def _resolve_dm_recipients(self, meeting: Meeting) -> list[discord.abc.User]:
         recipients: dict[int, discord.abc.User] = {}
@@ -173,6 +223,11 @@ class ReminderService:
                 recipients[member.id] = member
 
         return list(recipients.values())
+
+    def _channel_mentions(self, meeting: Meeting) -> str:
+        mentions = {target.mention for target in meeting.participant_targets}
+        mentions.add(f"<@{meeting.creator_id}>")
+        return " ".join(sorted(mentions))
 
 
 def _stage_text(stage: str) -> str:

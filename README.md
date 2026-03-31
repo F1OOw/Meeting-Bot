@@ -23,10 +23,12 @@ A `discord.py` slash-command bot that lets authorized users schedule meetings, e
   - 24 hours before the meeting
   - 1 hour before the meeting
   - when the meeting starts
+- Reminder messages are also posted to the configured meeting channel.
 - DM recipients include:
   - all tagged users
   - all current members of tagged roles
   - the meeting creator
+- Meeting edit and cancel commands use autocomplete for upcoming meetings.
 
 ## Project Structure
 
@@ -127,24 +129,30 @@ Notes:
     - `timezone`: `America/New_York`
 - `/show_config`
   - Shows the active configuration for the server.
-- `/schedule date time title participants details`
+- `/schedule date time target_channel title participants details`
   - Example values:
     - `date`: `2026-04-02`
     - `time`: `14:30`
+    - `target_channel`: `#planning-room`
     - `title`: `Sprint Planning`
     - `participants`: `<@123...> <@&456...>`
     - `details`: `Bring backlog updates`
+- `/edit_meeting meeting date time target_channel title participants details`
+  - All fields after `meeting` are optional.
+  - If `date` or `time` changes, the new schedule is revalidated against the configured allowed meeting window.
 - `/list_meetings`
   - Lists upcoming meetings.
-- `/cancel_meeting meeting_id`
-  - Cancels a scheduled meeting.
+- `/cancel_meeting meeting`
+  - Cancels a scheduled meeting using autocomplete instead of manual ID entry.
 
 ## Command Usage Notes
 
 - Meeting times are interpreted in the configured guild timezone.
+- `/schedule` requires a target reminder channel.
 - `participants` must include user mentions like `<@123...>` or role mentions like `<@&456...>`.
 - Administrators bypass the scheduler role restriction.
 - DM reminders go to tagged users, current members of tagged roles, and the meeting creator.
+- Reminder messages are posted in the selected text or voice channel as well.
 - Each DM includes the meeting title, time, channel, and optional details.
 
 ## Error Handling

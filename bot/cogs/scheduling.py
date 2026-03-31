@@ -188,6 +188,7 @@ class SchedulingCog(commands.Cog):
     @app_commands.describe(
         date="Meeting date in YYYY-MM-DD",
         time="Meeting time in HH:MM, based on the configured timezone",
+        target_channel="Text or voice channel for meeting reminders",
         title="Short meeting title",
         participants="Mention users and/or roles separated by spaces",
         details="Optional meeting details",
@@ -198,13 +199,14 @@ class SchedulingCog(commands.Cog):
         interaction: discord.Interaction,
         date: str,
         time: str,
+        target_channel: app_commands.AppCommandChannel,
         title: str,
         participants: str,
         details: str | None = None,
     ) -> None:
-        if interaction.guild is None or interaction.channel is None:
+        if interaction.guild is None:
             await interaction.response.send_message(
-                "This command can only be used in a server channel.",
+                "This command can only be used in a server.",
                 ephemeral=True,
             )
             return
@@ -226,6 +228,14 @@ class SchedulingCog(commands.Cog):
         if not config.allowed_weekdays or not config.start_time or not config.end_time:
             await interaction.response.send_message(
                 "Allowed meeting hours are not configured yet. Ask an admin to run `/set_time_range`.",
+                ephemeral=True,
+            )
+            return
+
+        meeting_channel = self._validate_target_channel(target_channel)
+        if meeting_channel is None:
+            await interaction.response.send_message(
+                "Target channel must be a text channel or voice channel.",
                 ephemeral=True,
             )
             return
@@ -266,7 +276,7 @@ class SchedulingCog(commands.Cog):
 
         meeting_id = self.database.create_meeting(
             guild_id=interaction.guild.id,
-            channel_id=interaction.channel.id,
+            channel_id=meeting_channel.id,
             creator_id=interaction.user.id,
             title=title,
             details=details,
@@ -281,11 +291,168 @@ class SchedulingCog(commands.Cog):
             f"ID: `{meeting_id}`\n"
             f"Title: **{discord.utils.escape_markdown(title)}**\n"
             f"When: <t:{start_unix}:F>\n"
+            f"Reminder channel: {meeting_channel.mention}\n"
             "DM notifications: `24h before`, `1h before`, and `at start`\n"
             f"Participants: {mention_preview}\n"
             f"Organizer DM: <@{interaction.user.id}>"
             + (f"\nDetails: {details}" if details else ""),
             allowed_mentions=discord.AllowedMentions(users=False, roles=False),
+        )
+
+    @app_commands.command(
+        name="edit_meeting",
+        description="Reschedule or update a scheduled meeting.",
+    )
+    @app_commands.describe(
+        meeting="Select the meeting to edit",
+        date="New date in YYYY-MM-DD",
+        time="New time in HH:MM, based on the configured timezone",
+        target_channel="New text or voice channel for meeting reminders",
+        title="New title",
+        participants="New user and/or role mentions separated by spaces",
+        details="New details text",
+    )
+    @app_commands.guild_only()
+    async def edit_meeting(
+        self,
+        interaction: discord.Interaction,
+        meeting: str,
+        date: str | None = None,
+        time: str | None = None,
+        target_channel: app_commands.AppCommandChannel | None = None,
+        title: str | None = None,
+        participants: str | None = None,
+        details: str | None = None,
+    ) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True,
+            )
+            return
+
+        meeting_id = self._parse_meeting_choice(meeting)
+        if meeting_id is None:
+            await interaction.response.send_message(
+                "Invalid meeting selection.",
+                ephemeral=True,
+            )
+            return
+
+        existing_meeting = self.database.get_meeting(meeting_id, interaction.guild.id)
+        if existing_meeting is None or existing_meeting.status != "scheduled":
+            await interaction.response.send_message(
+                "Meeting not found, or it has already been cancelled.",
+                ephemeral=True,
+            )
+            return
+
+        config = self.database.get_guild_config(interaction.guild.id)
+        is_creator = existing_meeting.creator_id == interaction.user.id
+        if not (self._can_schedule(interaction.user, config) or is_creator):
+            await interaction.response.send_message(
+                "You can only edit meetings you created unless you are an admin or scheduler.",
+                ephemeral=True,
+            )
+            return
+
+        if (
+            date is None
+            and time is None
+            and target_channel is None
+            and title is None
+            and participants is None
+            and details is None
+        ):
+            await interaction.response.send_message(
+                "Provide at least one field to update.",
+                ephemeral=True,
+            )
+            return
+
+        guild_timezone = parse_timezone(config.timezone)
+        existing_local_start = existing_meeting.starts_at_utc.astimezone(guild_timezone)
+
+        try:
+            new_date = parse_date_input(date) if date is not None else existing_local_start.date()
+            new_time = parse_time_input(time) if time is not None else existing_local_start.time().replace(
+                tzinfo=None, second=0, microsecond=0
+            )
+            participant_targets = (
+                await parse_participant_mentions(interaction.guild, participants)
+                if participants is not None
+                else existing_meeting.participant_targets
+            )
+        except ParsingError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        if target_channel is not None:
+            meeting_channel = self._validate_target_channel(target_channel)
+        else:
+            meeting_channel = None
+
+        if target_channel is not None and meeting_channel is None:
+            await interaction.response.send_message(
+                "Target channel must be a text channel or voice channel.",
+                ephemeral=True,
+            )
+            return
+
+        new_local_start = datetime.combine(new_date, new_time).replace(
+            tzinfo=guild_timezone
+        )
+        now_local = datetime.now(guild_timezone)
+        if new_local_start <= now_local:
+            await interaction.response.send_message(
+                "The meeting time must be in the future.",
+                ephemeral=True,
+            )
+            return
+
+        start_changed = date is not None or time is not None
+        if start_changed and not self._is_within_allowed_window(new_local_start, config):
+            await interaction.response.send_message(
+                "That meeting time is outside the allowed meeting window.\n"
+                f"Allowed weekdays: `{format_weekdays(config.allowed_weekdays)}`\n"
+                f"Allowed hours: `{config.start_time}`-`{config.end_time}` `{config.timezone}`",
+                ephemeral=True,
+            )
+            return
+
+        updated_title = title if title is not None else existing_meeting.title
+        updated_details = details if details is not None else existing_meeting.details
+        updated_starts_at_utc = new_local_start.astimezone(timezone.utc)
+        reset_notifications = updated_starts_at_utc != existing_meeting.starts_at_utc
+
+        updated = self.database.update_meeting(
+            meeting_id=existing_meeting.meeting_id,
+            guild_id=interaction.guild.id,
+            title=updated_title,
+            details=updated_details,
+            starts_at_utc=updated_starts_at_utc,
+            channel_id=meeting_channel.id if meeting_channel is not None else existing_meeting.channel_id,
+            participant_targets=participant_targets,
+            reset_notifications=reset_notifications,
+        )
+        if not updated:
+            await interaction.response.send_message(
+                "Meeting could not be updated.",
+                ephemeral=True,
+            )
+            return
+
+        start_unix = int(updated_starts_at_utc.timestamp())
+        mention_preview = " ".join(target.mention for target in participant_targets)
+        await interaction.response.send_message(
+            "Meeting updated.\n"
+            f"ID: `{existing_meeting.meeting_id}`\n"
+            f"Title: **{discord.utils.escape_markdown(updated_title)}**\n"
+            f"When: <t:{start_unix}:F>\n"
+            f"Reminder channel: <#{meeting_channel.id if meeting_channel is not None else existing_meeting.channel_id}>\n"
+            f"Participants: {mention_preview}"
+            + (f"\nDetails: {updated_details}" if updated_details else ""),
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     @app_commands.command(
@@ -327,11 +494,19 @@ class SchedulingCog(commands.Cog):
     )
     @app_commands.guild_only()
     async def cancel_meeting(
-        self, interaction: discord.Interaction, meeting_id: int
+        self, interaction: discord.Interaction, meeting: str
     ) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
                 "This command can only be used in a server.", ephemeral=True
+            )
+            return
+
+        meeting_id = self._parse_meeting_choice(meeting)
+        if meeting_id is None:
+            await interaction.response.send_message(
+                "Invalid meeting selection.",
+                ephemeral=True,
             )
             return
 
@@ -364,6 +539,42 @@ class SchedulingCog(commands.Cog):
             f"Meeting `{meeting_id}` has been cancelled.",
             ephemeral=True,
         )
+
+    @cancel_meeting.autocomplete("meeting")
+    @edit_meeting.autocomplete("meeting")
+    async def meeting_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return []
+
+        config = self.database.get_guild_config(interaction.guild.id)
+        creator_filter = None
+        if not self._can_schedule(interaction.user, config):
+            creator_filter = interaction.user.id
+
+        meetings = self.database.search_upcoming_meetings(
+            guild_id=interaction.guild.id,
+            query=current,
+            creator_id=creator_filter,
+        )
+        try:
+            guild_timezone = parse_timezone(config.timezone)
+        except ParsingError:
+            guild_timezone = timezone.utc
+
+        choices: list[app_commands.Choice[str]] = []
+        for meeting in meetings[:25]:
+            local_start = meeting.starts_at_utc.astimezone(guild_timezone)
+            channel = self._resolve_existing_channel(interaction.guild, meeting.channel_id)
+            channel_label = channel.name if channel is not None else f"channel-{meeting.channel_id}"
+            title_label = discord.utils.escape_markdown(meeting.title)[:40]
+            name = (
+                f"{meeting.meeting_id} | {title_label} | "
+                f"{local_start:%Y-%m-%d %H:%M} | #{channel_label}"
+            )[:100]
+            choices.append(app_commands.Choice(name=name, value=str(meeting.meeting_id)))
+        return choices
 
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
@@ -405,5 +616,26 @@ class SchedulingCog(commands.Cog):
         start_unix = int(meeting.starts_at_utc.timestamp())
         return (
             f"`{meeting.meeting_id}` | **{discord.utils.escape_markdown(meeting.title)}** | "
-            f"<t:{start_unix}:F> | DMs `24h` `1h` `start` | {mentions}"
+            f"<t:{start_unix}:F> | <#{meeting.channel_id}> | DMs `24h` `1h` `start` | {mentions}"
         )
+
+    def _parse_meeting_choice(self, value: str) -> int | None:
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
+    def _validate_target_channel(
+        self, channel: app_commands.AppCommandChannel
+    ) -> discord.TextChannel | discord.VoiceChannel | None:
+        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+            return channel
+        return None
+
+    def _resolve_existing_channel(
+        self, guild: discord.Guild, channel_id: int
+    ) -> discord.TextChannel | discord.VoiceChannel | None:
+        channel = guild.get_channel(channel_id)
+        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+            return channel
+        return None
