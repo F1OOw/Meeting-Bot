@@ -489,6 +489,48 @@ class SchedulingCog(commands.Cog):
         )
 
     @app_commands.command(
+        name="my_meetings",
+        description="List upcoming meetings you are invited to in this server.",
+    )
+    @app_commands.guild_only()
+    async def my_meetings(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+
+        meetings = self.database.list_upcoming_meetings(interaction.guild.id)
+        now_utc = datetime.now(timezone.utc)
+        member_role_ids = {role.id for role in interaction.user.roles}
+
+        invited = []
+        for meeting in meetings:
+            if meeting.starts_at_utc <= now_utc:
+                continue
+            for target in meeting.participant_targets:
+                if target.target_type == "user" and target.target_id == interaction.user.id:
+                    invited.append(meeting)
+                    break
+                if target.target_type == "role" and target.target_id in member_role_ids:
+                    invited.append(meeting)
+                    break
+
+        if not invited:
+            await interaction.response.send_message(
+                "You are not invited to any upcoming meetings in this server.",
+                ephemeral=True,
+            )
+            return
+
+        lines = [self._format_meeting_line(meeting) for meeting in invited[:20]]
+        await interaction.response.send_message(
+            "Upcoming meetings you're invited to:\n" + "\n".join(lines),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(
         name="cancel_meeting",
         description="Cancel a scheduled meeting by its ID.",
     )
@@ -627,15 +669,29 @@ class SchedulingCog(commands.Cog):
 
     def _validate_target_channel(
         self, channel: app_commands.AppCommandChannel
-    ) -> discord.TextChannel | discord.VoiceChannel | None:
-        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+    ) -> app_commands.AppCommandChannel | None:
+        # In discord.py 2.4+, channel options may resolve to lightweight "app command"
+        # channel objects rather than concrete TextChannel/VoiceChannel instances.
+        # The only capability we need here is a valid channel `id`.
+        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel)):
+            return channel
+        channel_type = getattr(channel, "type", None)
+        channel_type_value = (
+            getattr(channel_type, "value", None)
+            if not isinstance(channel_type, int)
+            else int(channel_type)
+        )
+        channel_id = getattr(channel, "id", None)
+        # Discord API channel type values:
+        # 0 = GUILD_TEXT, 2 = GUILD_VOICE, 5 = GUILD_ANNOUNCEMENT, 13 = GUILD_STAGE_VOICE
+        if isinstance(channel_id, int) and channel_type_value in {0, 2, 5, 13}:
             return channel
         return None
 
     def _resolve_existing_channel(
         self, guild: discord.Guild, channel_id: int
-    ) -> discord.TextChannel | discord.VoiceChannel | None:
+    ) -> discord.TextChannel | discord.VoiceChannel | discord.StageChannel | None:
         channel = guild.get_channel(channel_id)
-        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel)):
             return channel
         return None
